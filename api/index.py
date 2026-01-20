@@ -2,119 +2,83 @@ from fastapi import FastAPI, HTTPException, Query
 from fastapi.middleware.cors import CORSMiddleware
 import requests
 from bs4 import BeautifulSoup
-import urllib.parse
+import re
 
 app = FastAPI()
 
-# --- 1. CONFIGURATION ---
-# Penting: CORS diaktifkan agar frontend (HTML) bisa akses API ini
+# --- CONFIGURATION ---
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],  # Mengizinkan semua domain akses
+    allow_origins=["*"],
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
 
+# Header disesuaikan agar tidak diblokir Cloudflare/Firewall sederhana
 HEADERS = {
-    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36",
-    "Referer": "https://anichin.moe/"
+    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+    "Referer": "https://anichin.moe/",
+    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8"
 }
 
 BASE_URL = "https://anichin.moe"
 
-# --- 2. HELPER FUNCTIONS ---
+# --- HELPER ---
 def get_soup(url, params=None):
     try:
-        # Timeout 15 detik agar tidak hang jika web lambat
         req = requests.get(url, headers=HEADERS, params=params, timeout=15)
         req.raise_for_status()
         return BeautifulSoup(req.text, "html.parser")
-    except requests.exceptions.RequestException as e:
-        print(f"Error accessing {url}: {e}")
+    except Exception as e:
+        print(f"Error scraping {url}: {e}")
         return None
 
-# --- 3. ENDPOINTS ---
+# --- ENDPOINTS ---
 
 @app.get("/")
 def home():
-    return {
-        "status": "Alive",
-        "message": "Anichin Scraper API V2",
-        "endpoints": {
-            "search": "/api/search?s=Judul",
-            "schedule": "/api/schedule",
-            "recommended": "/api/recommended",
-            "detail": "/api/detail?url=LinkHalaman"
-        }
-    }
+    return {"message": "Anichin Scraper API Pro V3 is Running"}
 
-# --- SEARCH FUNCTION (DIPERBAIKI) ---
+# 1. SEARCH
 @app.get("/api/search")
-def search_anime(s: str = Query(..., description="Search keyword")):
-    # Kita biarkan requests library menangani encoding ?s=...
+def search_anime(s: str = Query(..., alias="s")):
     soup = get_soup(BASE_URL, params={'s': s})
-    
-    if not soup:
-        raise HTTPException(status_code=500, detail="Gagal mengambil data dari Anichin")
+    if not soup: raise HTTPException(status_code=500, detail="Server Error")
 
     results = []
-    # Mencari container hasil pencarian
-    # Selector .listupd article.bs adalah standar tema web ini
+    # Mencari container hasil
     articles = soup.select("div.listupd article.bs")
     
     for item in articles:
         try:
-            # Title
-            title_el = item.select_one("div.tt")
-            title = title_el.text.strip() if title_el else "No Title"
+            title = item.select_one("div.tt").text.strip()
+            thumb = item.select_one("img")["src"]
+            link = item.select_one("a")["href"]
+            type_show = item.select_one("div.typez").text.strip() if item.select_one("div.typez") else "Series"
+            status = item.select_one("div.status").text.strip() if item.select_one("div.status") else "?"
             
-            # Thumbnail
-            img_el = item.select_one("img")
-            thumb = img_el.get("src") if img_el else ""
-            
-            # Link
-            link_el = item.select_one("a")
-            link = link_el.get("href") if link_el else ""
-            
-            # Type (Donghua/Movie)
-            type_el = item.select_one("div.typez")
-            tipe = type_el.text.strip() if type_el else "Series"
-
-            # Status
-            stat_el = item.select_one("div.status")
-            status = stat_el.text.strip() if stat_el else "Unknown"
-
             results.append({
                 "title": title,
                 "thumbnail": thumb,
-                "type": tipe,
+                "type": type_show,
                 "status": status,
                 "url": link
             })
-        except Exception as e:
-            continue # Skip jika ada 1 item error
+        except: continue
 
-    return {
-        "status": "success", 
-        "query": s,
-        "total": len(results),
-        "data": results
-    }
+    return {"status": "success", "data": results}
 
-# --- SCHEDULE FUNCTION ---
+# 2. SCHEDULE
 @app.get("/api/schedule")
 def get_schedule():
-    url = f"{BASE_URL}/schedule/"
-    soup = get_soup(url)
-    if not soup:
-        raise HTTPException(status_code=500, detail="Cannot fetch schedule")
+    soup = get_soup(f"{BASE_URL}/schedule/")
+    if not soup: raise HTTPException(status_code=500)
     
     data = []
-    # Loop setiap box hari
     for box in soup.select("div.bixbox"):
         day_el = box.select_one("div.releases h3")
-        if not day_el: continue # Skip jika bukan box jadwal
+        if not day_el: continue
         
         day_name = day_el.text.strip()
         anime_list = []
@@ -124,37 +88,27 @@ def get_schedule():
                 title = anime.select_one("div.tt").text.strip()
                 link = anime.select_one("a")["href"]
                 thumb = anime.select_one("img")["src"]
+                ep = anime.select_one("div.epx").text.strip() if anime.select_one("div.epx") else ""
+                time_rel = anime.select_one("div.time").text.strip() if anime.select_one("div.time") else ""
                 
-                # Episode text
-                ep_el = anime.select_one("div.epx") or anime.select_one("span.epx")
-                episode = ep_el.text.strip() if ep_el else "?"
-                
-                # Time release (kadang ada)
-                time_el = anime.select_one("div.time")
-                time_rel = time_el.text.strip() if time_el else ""
-
                 anime_list.append({
-                    "title": title,
-                    "thumbnail": thumb,
-                    "episode": episode,
-                    "time": time_rel,
+                    "title": title, 
+                    "thumbnail": thumb, 
+                    "episode": ep, 
+                    "time": time_rel, 
                     "url": link
                 })
-            except:
-                continue
-
+            except: continue
+            
         if anime_list:
             data.append({"day": day_name, "list": anime_list})
             
     return {"status": "success", "data": data}
 
-# --- RECOMMENDED / HOMEPAGE ---
+# 3. RECOMMENDED
 @app.get("/api/recommended")
 def get_recommended():
-    # Mengambil dari halaman 'anime' (list) atau homepage
-    url = f"{BASE_URL}/anime/"
-    soup = get_soup(url)
-    
+    soup = get_soup(f"{BASE_URL}/anime/")
     if not soup: raise HTTPException(status_code=500)
 
     results = []
@@ -163,77 +117,110 @@ def get_recommended():
             title = item.select_one("div.tt").text.strip()
             thumb = item.select_one("img")["src"]
             link = item.select_one("a")["href"]
-            
-            # Mengambil rating jika ada
-            rating_el = item.select_one("div.rating")
-            rating = rating_el.text.strip() if rating_el else "-"
+            type_show = item.select_one("div.typez").text.strip() if item.select_one("div.typez") else ""
+            status = item.select_one("div.status").text.strip() if item.select_one("div.status") else ""
 
             results.append({
                 "title": title,
                 "thumbnail": thumb,
-                "rating": rating,
+                "type": type_show,
+                "status": status,
                 "url": link
             })
-        except:
-            continue
+        except: continue
 
     return {"status": "success", "data": results}
 
-# --- DETAIL PAGE & STREAM ---
+# 4. DETAIL (FULL FIX)
 @app.get("/api/detail")
 def get_detail(url: str):
-    # Validasi URL sederhana
     if not url.startswith("http"):
         raise HTTPException(status_code=400, detail="Invalid URL")
-
+        
     soup = get_soup(url)
-    if not soup:
-        raise HTTPException(status_code=404, detail="Page not found")
+    if not soup: raise HTTPException(status_code=404, detail="Page Not Found")
 
-    # 1. Info Utama
-    title_el = soup.select_one("h1.entry-title")
-    title = title_el.text.strip() if title_el else "Unknown"
+    # --- A. DATA UTAMA ---
+    title = soup.select_one("h1.entry-title").text.strip() if soup.select_one("h1.entry-title") else "Unknown"
     
-    synopsis_el = soup.select_one("div.entry-content[itemprop='description']")
-    # Fallback jika synopsis selector beda
-    if not synopsis_el:
-        synopsis_el = soup.select_one("div.entry-content")
-    synopsis = synopsis_el.text.strip() if synopsis_el else ""
+    # Synopsis (Cari beberapa kemungkinan selector)
+    synopsis = "No synopsis"
+    syn_el = soup.select_one("div.entry-content[itemprop='description']") or soup.select_one("div.entry-content")
+    if syn_el:
+        synopsis = syn_el.get_text(separator="\n", strip=True)
 
-    # 2. Get Video Stream (Iframe)
+    # Thumbnail
+    thumb_el = soup.select_one("div.thumb img")
+    thumbnail = thumb_el["src"] if thumb_el else ""
+
+    # --- B. INFO DETAIL (Genre, Status, dll) ---
+    info_data = {
+        "status": "Unknown",
+        "studio": "Unknown",
+        "released": "Unknown",
+        "duration": "Unknown",
+        "genres": []
+    }
+
+    # Scrape Info Box (.infox)
+    try:
+        # Genre
+        genres = [a.text.strip() for a in soup.select("div.genxed a")]
+        info_data["genres"] = genres
+        
+        # Info baris per baris (Status, Studio, dll)
+        # Biasanya struktur: <div class="spe"><span><b>Status:</b> On Going</span></div>
+        for span in soup.select("div.spe span"):
+            text = span.text.strip()
+            if "Status:" in text: info_data["status"] = text.replace("Status:", "").strip()
+            if "Studio:" in text: info_data["studio"] = text.replace("Studio:", "").strip()
+            if "Released:" in text: info_data["released"] = text.replace("Released:", "").strip()
+            if "Duration:" in text: info_data["duration"] = text.replace("Duration:", "").strip()
+    except:
+        pass
+
+    # --- C. STREAM / VIDEO SOURCES (LOGIC UTAMA) ---
     streams = []
     
-    # Cara 1: Cari elemen iframe di .video-content
-    iframe = soup.select_one("div.video-content iframe")
-    if iframe:
-        src = iframe.get("src") or iframe.get("data-src")
-        streams.append({"server": "Main Server", "url": src})
-    
-    # Cara 2: Cari di dropdown/list server mirror
-    # Biasanya ada di <select> atau <ul>
-    mirrors = soup.select("ul#playeroptionsul li")
-    for m in mirrors:
-        name = m.select_one("span.title").text.strip()
-        # Ambil data-src, data-nume, atau atribut lain yang menyimpan link
-        link = m.get("data-src") or m.get("data-nume")
-        if link:
-            streams.append({"server": name, "url": link})
+    # Logika 1: Ambil dari list Server (Biasanya di ul#playeroptionsul)
+    server_list = soup.select("ul#playeroptionsul li")
+    for li in server_list:
+        try:
+            name = li.select_one("span.title").text.strip()
+            # Link video biasanya di atribut 'data-src', 'data-url', atau 'data-nume'
+            # Kita cek semuanya
+            video_url = li.get("data-src") or li.get("data-url") or li.get("data-nume")
+            
+            if video_url:
+                streams.append({"server": name, "url": video_url})
+        except: continue
 
-    # 3. Get Episode List (Navigasi)
+    # Logika 2: Jika list server kosong, cari iframe langsung (Default player)
+    if not streams:
+        iframe = soup.select_one("div.video-content iframe") or soup.select_one("div#embed_holder iframe")
+        if iframe:
+            src = iframe.get("src")
+            if src:
+                streams.append({"server": "Default Server", "url": src})
+
+    # --- D. EPISODE LIST ---
     episodes = []
-    # Biasanya ada di div.bixbox.lpl atau ul#episodes
-    ep_list_el = soup.select("div.bixbox.lpl li a")
-    for ep in ep_list_el:
-        ep_title = ep.select_one("div.lpl_title") or ep.select_one("span.lpl_title")
-        t = ep_title.text.strip() if ep_title else ep.text.strip()
-        l = ep["href"]
-        episodes.append({"title": t, "url": l})
+    # Biasanya ada di dalam div.lpl atau ul#episodes
+    ep_links = soup.select("div.bixbox.lpl li a")
+    for link in ep_links:
+        try:
+            ep_title = link.select_one("div.lpl_title").text.strip() if link.select_one("div.lpl_title") else link.text.strip()
+            ep_url = link["href"]
+            episodes.append({"title": ep_title, "url": ep_url})
+        except: continue
 
     return {
         "status": "success",
         "data": {
             "title": title,
+            "thumbnail": thumbnail,
             "synopsis": synopsis,
+            "info": info_data,
             "streams": streams,
             "episodes": episodes
         }
