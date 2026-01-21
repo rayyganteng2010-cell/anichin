@@ -6,6 +6,7 @@ import re
 
 app = FastAPI()
 
+# --- CONFIGURATION ---
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -22,21 +23,22 @@ HEADERS = {
 BASE_URL = "https://anichin.cafe"
 CREATOR = "Sanka Vollerei"
 
+# --- HELPER FUNCTIONS ---
 def get_soup(url, params=None):
     try:
-        req = requests.get(url, headers=HEADERS, params=params, timeout=15)
+        req = requests.get(url, headers=HEADERS, params=params, timeout=20)
         req.raise_for_status()
         return BeautifulSoup(req.text, "html.parser")
     except Exception as e:
-        print(f"Error: {e}")
+        print(f"Error accessing {url}: {e}")
         return None
 
 def extract_slug(url):
     parts = url.strip("/").split("/")
     return parts[-1] if parts else ""
 
-# --- PARSER STANDAR (Untuk Home/Ongoing) ---
 def parse_card(element):
+    """Parser untuk kartu anime di halaman list (Home, Search, dll)"""
     try:
         title_el = element.select_one("div.tt") or element.select_one(".entry-title")
         link_el = element.select_one("a")
@@ -55,77 +57,101 @@ def parse_card(element):
             "title": title_el.text.strip(),
             "slug": slug,
             "poster": img_el["src"] if img_el else "",
-            "status": status_el.text.strip() if status_el else "Ongoing",
+            "status": status_el.text.strip() if status_el else "Unknown",
             "type": type_el.text.strip() if type_el else "Donghua",
-            "sub": "Sub", # Default
+            "current_episode": ep_el.text.strip() if ep_el else "?",
             "href": f"/donghua/detail/{slug}",
             "anichinUrl": url
         }
     except: return None
 
-# --- PARSER DETAIL (Untuk Season/Search Musim) ---
-# Mengambil data dari Tooltip (.tt) yang biasanya tersembunyi
-def parse_detailed_card(element):
-    try:
-        basic = parse_card(element)
-        if not basic: return None
+def get_list_by_filter(status="", order="", type_param="", sub=""):
+    """Helper untuk mengambil data dari halaman /seri/ dengan filter"""
+    params = {
+        "status": status,
+        "order": order,
+        "type": type_param,
+        "sub": sub
+    }
+    soup = get_soup(f"{BASE_URL}/seri/", params=params)
+    if not soup: raise HTTPException(status_code=500, detail="Failed to fetch data")
+    
+    data = []
+    for item in soup.select("div.listupd article.bs"):
+        c = parse_card(item)
+        if c: data.append(c)
         
-        # Scrape data hidden dari div.tt (Tooltip)
-        # Struktur tema biasanya: div.tt > div.gnr, div.desc, div.rat
-        tt = element.select_one("div.tt") # Ini container tooltip di banyak tema
-        
-        # Data default jika tidak ketemu
-        rating = 0
-        studio = "-"
-        desc = "-"
-        alt = "-"
-        genres_list = []
-        
-        # Coba ambil rating
-        rat_el = element.select_one("div.numscore") or element.select_one("span.numscore")
-        if rat_el: rating = rat_el.text.strip()
+    return {"status": "success", "creator": CREATOR, "data": data}
 
-        # Coba ambil deskripsi/sinopsis dari tooltip (jika ada)
-        # Note: Anichin kadang tidak merender full desc di list, kita coba best effort
-        # Kita pakai basic data dulu, lalu extend
-        
-        return {
-            "title": basic['title'],
-            "slug": basic['slug'],
-            "poster": basic['poster'],
-            "status": basic['status'],
-            "type": basic['type'],
-            "episodes": basic.get('status', 'Unknown'), # Fallback
-            "alternative": alt,
-            "rating": rating,
-            "studio": studio,
-            "description": desc,
-            "genres": genres_list, # Web biasanya ga nampilin list genre lengkap di card view
-            "href": basic['href'],
-            "anichinUrl": basic['anichinUrl']
-        }
-    except: return None
-
-# --- ENDPOINTS ---
+# --- ENDPOINTS UTAMA ---
 
 @app.get("/")
 def home():
-    soup = get_soup(BASE_URL)
-    if not soup: raise HTTPException(status_code=500)
-    data = [parse_card(i) for i in soup.select("div.listupd article.bs") if parse_card(i)]
-    return {"status": "success", "creator": CREATOR, "latest_release": data}
+    # Latest Release: /seri/?status=&type=&order=update
+    return get_list_by_filter(order="update")
+
+@app.get("/api/popular")
+def popular():
+    # Popular: /seri/?status=&type=&order=popular
+    return get_list_by_filter(order="popular")
+
+@app.get("/api/rating")
+def rating():
+    # Highest Rating: /seri/?sub=&order=rating
+    return get_list_by_filter(order="rating")
 
 @app.get("/api/ongoing")
 def ongoing():
-    soup = get_soup(f"{BASE_URL}/ongoing/")
-    data = [parse_card(i) for i in soup.select("div.listupd article.bs") if parse_card(i)]
-    return {"status": "success", "creator": CREATOR, "ongoing_donghua": data}
+    # Ongoing: /seri/?status=ongoing&sub=
+    return get_list_by_filter(status="ongoing")
 
 @app.get("/api/completed")
 def completed():
-    soup = get_soup(f"{BASE_URL}/completed/")
+    # Completed: /seri/?status=completed&type=&order=
+    return get_list_by_filter(status="completed")
+
+# --- GENRES & SEASONS ---
+
+@app.get("/api/genres")
+def get_genres():
+    soup = get_soup(f"{BASE_URL}/seri/")
+    if not soup: raise HTTPException(status_code=500)
+    
+    genres = []
+    seen = set()
+    # Mencari link genre di sidebar/widget
+    for a in soup.select("a[href*='/genres/']"):
+        try:
+            name = a.text.strip()
+            href = a["href"]
+            slug = extract_slug(href)
+            if slug and slug not in seen and name:
+                seen.add(slug)
+                genres.append({
+                    "name": name,
+                    "slug": slug,
+                    "href": f"/donghua/genres/{slug}",
+                    "anichinUrl": href
+                })
+        except: continue
+    
+    return {"creator": CREATOR, "data": sorted(genres, key=lambda x: x['name'])}
+
+@app.get("/api/genres/{slug}")
+def get_by_genre(slug: str):
+    soup = get_soup(f"{BASE_URL}/genres/{slug}/")
+    if not soup: raise HTTPException(status_code=404)
     data = [parse_card(i) for i in soup.select("div.listupd article.bs") if parse_card(i)]
-    return {"status": "success", "creator": CREATOR, "completed_donghua": data}
+    return {"creator": CREATOR, "data": data}
+
+@app.get("/api/season/{slug}")
+def get_by_season(slug: str):
+    soup = get_soup(f"{BASE_URL}/season/{slug}/")
+    if not soup: raise HTTPException(status_code=404)
+    data = [parse_card(i) for i in soup.select("div.listupd article.bs") if parse_card(i)]
+    return {"creator": CREATOR, "data": data}
+
+# --- SCHEDULE & SEARCH ---
 
 @app.get("/api/schedule")
 def schedule():
@@ -139,95 +165,14 @@ def schedule():
         for item in box.select("div.listupd div.bs"):
             c = parse_card(item)
             if c:
-                # Custom field untuk schedule
                 time = item.select_one("div.time").text.strip() if item.select_one("div.time") else ""
+                # Modifikasi field agar sesuai request schedule
                 donghua_list.append({
                     "title": c['title'], "slug": c['slug'], "poster": c['poster'], 
-                    "release_time": time, "episode": "Unknown", 
-                    "href": c['href'], "anichinUrl": c['anichinUrl']
+                    "release_time": time, "href": c['href'], "anichinUrl": c['anichinUrl']
                 })
         if donghua_list: schedule_data.append({"day": day_name, "donghua_list": donghua_list})
     return {"status": "success", "creator": CREATOR, "schedule": schedule_data}
-
-# --- NEW: GENRES LIST ---
-@app.get("/api/genres")
-def get_all_genres():
-    soup = get_soup(BASE_URL) # Genre biasanya ada di sidebar home/all page
-    genres = []
-    
-    # Mencari widget genre (biasanya ul.genre atau div.genre)
-    # Kita cari semua link yang mengandung /genres/
-    seen = set()
-    for a in soup.select("a[href*='/genres/']"):
-        name = a.text.strip()
-        url = a["href"]
-        slug = extract_slug(url)
-        
-        if slug not in seen and name:
-            seen.add(slug)
-            genres.append({
-                "name": name,
-                "slug": slug,
-                "href": f"/donghua/genres/{slug}",
-                "anichinUrl": url
-            })
-    
-    # Sort A-Z
-    genres = sorted(genres, key=lambda x: x['name'])
-    return {"creator": CREATOR, "data": genres}
-
-# --- NEW: DONGHUA BY GENRE ---
-@app.get("/api/genres/{slug}")
-def get_by_genre(slug: str):
-    url = f"{BASE_URL}/genres/{slug}/"
-    soup = get_soup(url)
-    if not soup: raise HTTPException(status_code=404)
-    
-    data = [parse_card(i) for i in soup.select("div.listupd article.bs") if parse_card(i)]
-    return {"creator": CREATOR, "data": data}
-
-# --- NEW: DONGHUA BY SEASON ---
-@app.get("/api/season/{slug}")
-def get_by_season(slug: str):
-    # Contoh slug: spring-2024, winter-2025
-    url = f"{BASE_URL}/season/{slug}/"
-    soup = get_soup(url)
-    if not soup: raise HTTPException(status_code=404)
-    
-    # Gunakan parser yang lebih detail jika memungkinkan, 
-    # tapi karena keterbatasan list view, kita pakai parser standar + enrichment
-    # Agar sesuai request JSON "cari donghua berdasarkan musim"
-    
-    data = []
-    for item in soup.select("div.listupd article.bs"):
-        basic = parse_card(item)
-        if not basic: continue
-        
-        # Enrichment manual agar mirip JSON request (Data dummy utk list view karena web aslinya hide info ini)
-        # Untuk data real 100%, scraper harus buka link satu2 (lambat).
-        # Kita ambil yg bisa diambil saja.
-        
-        rating = "0"
-        rat_el = item.select_one(".numscore")
-        if rat_el: rating = rat_el.text.strip()
-
-        data.append({
-            "title": basic['title'],
-            "slug": basic['slug'],
-            "poster": basic['poster'],
-            "status": basic['status'],
-            "type": basic['type'],
-            "episodes": "? eps", # List view jarang nampilin total eps
-            "alternative": "-",
-            "rating": rating,
-            "studio": "-",
-            "description": "...", # Deskripsi butuh request detail
-            "genres": [], # Genre butuh request detail
-            "href": basic['href'],
-            "anichinUrl": basic['anichinUrl']
-        })
-
-    return {"creator": CREATOR, "data": data}
 
 @app.get("/api/search")
 def search(s: str = Query(..., alias="s")):
@@ -235,27 +180,40 @@ def search(s: str = Query(..., alias="s")):
     data = [parse_card(i) for i in soup.select("div.listupd article.bs") if parse_card(i)]
     return {"creator": CREATOR, "data": data}
 
+# --- DETAIL (EPISODE & INFO) ---
+
 @app.get("/api/detail")
 def get_detail(url: str):
-    # (Kode Detail sama seperti sebelumnya - Full Logic)
     soup = get_soup(url)
     if not soup: raise HTTPException(status_code=404)
 
-    is_video = bool(soup.select_one("#playeroptionsul") or soup.select_one(".video-content"))
+    # Cek apakah ini halaman Nonton (Episode) atau Info Series
+    is_video = bool(soup.select_one("#playeroptionsul") or soup.select_one(".video-content") or soup.select_one("select.mirror"))
 
     if is_video:
+        # === EPISODE VIEW ===
         title = soup.select_one("h1.entry-title").text.strip()
+        
+        # 1. Servers
         servers = []
+        # List Mirror (UL/LI)
         for li in soup.select("ul#playeroptionsul li"):
             name = li.select_one(".title").text.strip()
             link = li.get("data-src") or li.get("data-url")
             if link: servers.append({"name": name, "url": link})
-        
+        # Select Option Mirror (Fallback)
+        if not servers:
+            for opt in soup.select("select.mirror option"):
+                val = opt.get("value")
+                if val: servers.append({"name": opt.text.strip(), "url": val})
+        # Iframe Default (Fallback Akhir)
         if not servers:
             iframe = soup.select_one(".video-content iframe")
             if iframe: servers.append({"name": "Default", "url": iframe["src"]})
+            
         main_url = servers[0] if servers else {"name": "None", "url": ""}
         
+        # 2. Downloads
         downloads = {}
         for box in soup.select("div.mctnx div.soraddl") + soup.select("div.soraurl"):
             res_el = box.select_one("div.res") or box.select_one("h3")
@@ -266,31 +224,73 @@ def get_detail(url: str):
             for a in box.select("a"): links_map[a.text.strip()] = a["href"]
             downloads[key] = links_map
 
+        # 3. Navigation
         nav = {}
-        nav_all = soup.select_one("div.nvs .nvsc a")
-        if nav_all: nav["all_episodes"] = {"slug": extract_slug(nav_all["href"]), "href": f"/donghua/detail/{extract_slug(nav_all['href'])}", "anichinUrl": nav_all["href"]}
         nav_prev = soup.select_one("div.nvs .nav-previous a")
-        if nav_prev: nav["previous_episode"] = {"episode": "Prev", "slug": extract_slug(nav_prev["href"]), "href": f"/donghua/episode/{extract_slug(nav_prev['href'])}", "anichinUrl": nav_prev["href"]}
+        if nav_prev: 
+            nav["previous_episode"] = {
+                "episode": "Previous Episode", 
+                "slug": extract_slug(nav_prev["href"]),
+                "href": f"/donghua/episode/{extract_slug(nav_prev['href'])}",
+                "anichinUrl": nav_prev["href"]
+            }
         nav_next = soup.select_one("div.nvs .nav-next a")
-        if nav_next: nav["next_episode"] = {"episode": "Next", "slug": extract_slug(nav_next["href"]), "href": f"/donghua/episode/{extract_slug(nav_next['href'])}", "anichinUrl": nav_next["href"]}
+        if nav_next: 
+            nav["next_episode"] = {
+                "episode": "Next Episode", 
+                "slug": extract_slug(nav_next["href"]),
+                "href": f"/donghua/episode/{extract_slug(nav_next['href'])}",
+                "anichinUrl": nav_next["href"]
+            }
+        nav_all = soup.select_one("div.nvs .nvsc a")
+        if nav_all:
+             nav["all_episodes"] = {
+                 "slug": extract_slug(nav_all["href"]),
+                 "href": f"/donghua/detail/{extract_slug(nav_all['href'])}",
+                 "anichinUrl": nav_all["href"]
+             }
 
+        # 4. Donghua Details (Metadata Singkat)
+        # Note: posted_by/uploader dihapus sesuai request
         thumb = soup.select_one("div.thumb img")
         donghua_details = {
-            "title": title.split("Episode")[0].strip(), "slug": extract_slug(url),
-            "poster": thumb["src"] if thumb else "", "type": "Donghua", "released": "?", "uploader": "admin",
-            "href": f"/donghua/detail/{extract_slug(url)}", "anichinUrl": url
+            "title": title.split("Episode")[0].strip(),
+            "slug": extract_slug(url),
+            "poster": thumb["src"] if thumb else "",
+            "type": "Donghua",
+            "released": "Unknown",
+            "href": f"/donghua/detail/{extract_slug(url)}",
+            "anichinUrl": url
         }
 
+        # 5. Episode List
         episodes_list = []
         for a in soup.select("div.bixbox.lpl li a"):
-             episodes_list.append({"episode": a.text.strip(), "slug": extract_slug(a["href"]), "href": f"/donghua/episode/{extract_slug(a['href'])}", "anichinUrl": a["href"]})
+             episodes_list.append({
+                 "episode": a.text.strip(), 
+                 "slug": extract_slug(a["href"]), 
+                 "href": f"/donghua/episode/{extract_slug(a['href'])}", 
+                 "anichinUrl": a["href"]
+             })
 
-        return {"status": "success", "creator": CREATOR, "episode": title, "streaming": {"main_url": main_url, "servers": servers}, "download_url": downloads, "donghua_details": donghua_details, "navigation": nav, "episodes_list": episodes_list}
+        return {
+            "status": "success",
+            "creator": CREATOR,
+            "episode": title,
+            "streaming": {"main_url": main_url, "servers": servers},
+            "download_url": downloads,
+            "donghua_details": donghua_details,
+            "navigation": nav,
+            "episodes_list": episodes_list
+        }
 
     else:
+        # === SERIES INFO VIEW ===
         title = soup.select_one("h1.entry-title").text.strip()
         thumb = soup.select_one("div.thumb img")["src"] if soup.select_one("div.thumb img") else ""
+        
         def get_val(k):
+            # Helper untuk ambil data dari div.spe (Info Table)
             found = soup.select_one(f"div.spe span:contains('{k}')")
             if found: return found.text.replace(k, "").replace(":", "").strip()
             for s in soup.select("div.spe span"):
@@ -299,12 +299,36 @@ def get_detail(url: str):
 
         genres = []
         for a in soup.select("div.genxed a"):
-            genres.append({"name": a.text.strip(), "slug": extract_slug(a["href"]), "href": f"/donghua/genres/{extract_slug(a['href'])}", "anichinUrl": a["href"]})
+            genres.append({
+                "name": a.text.strip(), 
+                "slug": extract_slug(a["href"]), 
+                "href": f"/donghua/genres/{extract_slug(a['href'])}", 
+                "anichinUrl": a["href"]
+            })
 
         episodes_list = []
         for li in soup.select("ul#episode_list li") + soup.select("div.eplister li"):
             a = li.select_one("a")
-            if a: episodes_list.append({"episode": a.text.strip(), "slug": extract_slug(a["href"]), "href": f"/donghua/episode/{extract_slug(a['href'])}", "anichinUrl": a["href"]})
+            if a: 
+                episodes_list.append({
+                    "episode": a.text.strip(), 
+                    "slug": extract_slug(a["href"]), 
+                    "href": f"/donghua/episode/{extract_slug(a['href'])}", 
+                    "anichinUrl": a["href"]
+                })
 
         syn = soup.select_one("div.entry-content[itemprop='description']")
-        return {"status": get_val("Status"), "creator": CREATOR, "title": title, "poster": thumb, "studio": get_val("Studio"), "released": get_val("Released"), "duration": get_val("Duration"), "type": get_val("Type"), "genres": genres, "synopsis": syn.get_text(separator="\n").strip() if syn else "", "episodes_list": episodes_list}
+        
+        return {
+            "status": get_val("Status"),
+            "creator": CREATOR,
+            "title": title,
+            "poster": thumb,
+            "studio": get_val("Studio"),
+            "released": get_val("Released"),
+            "duration": get_val("Duration"),
+            "type": get_val("Type"),
+            "genres": genres,
+            "synopsis": syn.get_text(separator="\n").strip() if syn else "",
+            "episodes_list": episodes_list
+        }
