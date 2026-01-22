@@ -19,7 +19,7 @@ app.add_middleware(
 
 # --- CONFIG ---
 BASE_URL = "https://anichin.moe"
-CREATOR = "Ray Van Vallerius"
+CREATOR = "Sanka Vollerei"
 
 HEADERS = {
     "User-Agent": (
@@ -209,8 +209,8 @@ def parse_card(element, is_schedule: bool = False):
             m_ep = re.search(r"(\d+)", ep_txt)
             episode_num = m_ep.group(1) if m_ep else (ep_txt or "??")
 
-            data["release_time"] = release_time
-            data["episode"] = episode
+            data["upload_at"] = upload_at
+            data["episode"] = episode_num
         else:
             data["current_episode"] = ep_txt or "??"
 
