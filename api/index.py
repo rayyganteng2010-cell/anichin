@@ -6,7 +6,7 @@ import re
 import base64
 from urllib.parse import urljoin
 
-app = FastAPI(title="Anichin Moe Scraper API")
+app = FastAPI(title="Anichin Moe Scraper API (Paged)")
 
 # --- CORS ---
 app.add_middleware(
@@ -32,11 +32,10 @@ HEADERS = {
     "Accept-Language": "id,en-US;q=0.9,en;q=0.8",
 }
 
-
 # --------------------------
 # HELPERS
 # --------------------------
-def get_soup(url: str, params=None) -> BeautifulSoup | None:
+def get_soup(url: str, params=None):
     try:
         req = requests.get(url, headers=HEADERS, params=params, timeout=25)
         req.raise_for_status()
@@ -76,7 +75,6 @@ def pick_first(*vals):
 
 
 def split_label_value(text: str):
-    # "Status: Ongoing" -> ("status", "Ongoing")
     if ":" not in text:
         return None, None
     k, v = text.split(":", 1)
@@ -86,10 +84,6 @@ def split_label_value(text: str):
 
 
 def decode_url(raw_url: str) -> str:
-    """
-    Decode Base64 yang biasanya berisi iframe HTML, ambil src="...".
-    Kalau sudah http, return langsung.
-    """
     if not raw_url:
         return ""
     if raw_url.startswith("http"):
@@ -106,6 +100,7 @@ def decode_url(raw_url: str) -> str:
 
 
 def build_list_params(
+    page: int,
     status: str | None,
     type_: str | None,
     sub: str | None,
@@ -113,11 +108,16 @@ def build_list_params(
     genres: list[str] | None,
 ):
     """
-    Bikin params sesuai pola Anichin:
-    /anime/?status=&type=&sub=&order=update
-    genre[] bisa lebih dari 1.
+    Anichin list query contoh:
+    /anime/?page=2&order=update&status=&type=&sub=
     """
     params = {}
+
+    # pagination (pakai query ?page=2)
+    if page and page > 1:
+        params["page"] = page
+
+    # filters (biar mirip situs, kita izinin kosong)
     if status is not None:
         params["status"] = status
     if type_ is not None:
@@ -126,8 +126,11 @@ def build_list_params(
         params["sub"] = sub
     if order is not None:
         params["order"] = order
+
+    # genre[] bisa banyak
     if genres:
         params["genre[]"] = genres
+
     return params
 
 
@@ -135,11 +138,6 @@ def build_list_params(
 # PARSERS
 # --------------------------
 def parse_card(element, is_schedule: bool = False):
-    """
-    Card parser untuk list/search/genre/schedule.
-    Output standar: title, poster, status, type, rating, episode/current_episode
-    Schedule: upload_at (HH:MM) + episode (angka)
-    """
     try:
         a = element.select_one("a")
         if not a or not a.get("href"):
@@ -148,7 +146,6 @@ def parse_card(element, is_schedule: bool = False):
         url = abs_url(a["href"])
         slug = extract_slug(url)
 
-        # title
         title_el = (
             element.select_one("div.tt")
             or element.select_one(".entry-title")
@@ -157,7 +154,6 @@ def parse_card(element, is_schedule: bool = False):
         )
         title = safe_text(title_el) or safe_text(a)
 
-        # poster
         img = element.select_one("img")
         poster = ""
         if img:
@@ -168,11 +164,9 @@ def parse_card(element, is_schedule: bool = False):
             )
         poster = abs_url(poster) if poster else ""
 
-        # episode text on card
         ep_el = element.select_one("div.epx") or element.select_one(".ep") or element.select_one(".episode")
         ep_txt = safe_text(ep_el)
 
-        # status/type/rating
         status_el = element.select_one("div.status") or element.select_one(".stat") or element.select_one(".status")
         status = safe_text(status_el) or "Ongoing"
 
@@ -200,17 +194,13 @@ def parse_card(element, is_schedule: bool = False):
         }
 
         if is_schedule:
-            # time text biasanya "at 14:25"
             time_el = element.select_one("div.time") or element.select_one(".time")
             time_txt = safe_text(time_el)
             m_time = re.search(r"(\d{1,2}:\d{2})", time_txt)
-            upload_at = m_time.group(1) if m_time else ""
+            data["upload_at"] = m_time.group(1) if m_time else ""
 
             m_ep = re.search(r"(\d+)", ep_txt)
-            episode_num = m_ep.group(1) if m_ep else (ep_txt or "??")
-
-            data["upload_at"] = upload_at
-            data["episode"] = episode_num
+            data["episode"] = m_ep.group(1) if m_ep else (ep_txt or "??")
         else:
             data["current_episode"] = ep_txt or "??"
 
@@ -220,7 +210,7 @@ def parse_card(element, is_schedule: bool = False):
         return None
 
 
-def parse_list_page(soup: BeautifulSoup | None):
+def parse_list_page(soup):
     if not soup:
         return []
 
@@ -236,8 +226,7 @@ def parse_list_page(soup: BeautifulSoup | None):
     return out
 
 
-def parse_series_detail(soup: BeautifulSoup, url: str):
-    # Title & alt title
+def parse_series_detail(soup, url: str):
     title = safe_text(soup.select_one("h1.entry-title")) or safe_text(soup.select_one("h1")) or ""
     alt_title = ""
     alt_el = (
@@ -246,11 +235,9 @@ def parse_series_detail(soup: BeautifulSoup, url: str):
     )
     alt_title = safe_text(alt_el)
 
-    # Poster
     thumb = soup.select_one("div.thumb img") or soup.select_one(".thumb img") or soup.select_one("img")
     poster = abs_url(thumb.get("src", "")) if thumb else ""
 
-    # Short description (paragraf panjang pertama)
     short_desc = ""
     entry = soup.select_one("div.entry-content") or soup.select_one("article")
     if entry:
@@ -260,7 +247,6 @@ def parse_series_detail(soup: BeautifulSoup, url: str):
                 short_desc = t
                 break
 
-    # Info fields
     info = {
         "status": "-",
         "network": "-",
@@ -305,7 +291,6 @@ def parse_series_detail(soup: BeautifulSoup, url: str):
         elif "updated on" in k:
             info["updated on"] = v
 
-    # Genres (link)
     genres = []
     seen = set()
     for a in soup.select("div.genxed a, .genxed a, a[href*='/genre/'], a[href*='/genres/']"):
@@ -320,7 +305,6 @@ def parse_series_detail(soup: BeautifulSoup, url: str):
         seen.add(key)
         genres.append({"name": name, "slug": slug, "anichinUrl": href})
 
-    # Synopsis
     synopsis_title = "Synopsis"
     synopsis_text = ""
 
@@ -346,7 +330,6 @@ def parse_series_detail(soup: BeautifulSoup, url: str):
         if syn:
             synopsis_text = syn.get_text("\n", strip=True)
 
-    # Episodes list on series page
     episodes_list = []
     for a in soup.select("ul#episode_list li a, .eplister li a, .episodelist li a"):
         href = a.get("href", "")
@@ -386,13 +369,12 @@ def parse_series_detail(soup: BeautifulSoup, url: str):
     }
 
 
-def parse_episode_detail(soup: BeautifulSoup, url: str):
+def parse_episode_detail(soup, url: str):
     episode_title = safe_text(soup.select_one("h1.entry-title")) or "Episode"
 
-    # --- STREAM SERVERS ---
+    # STREAM SERVERS
     servers = []
 
-    # 1) UL/LI servers
     for li in soup.select("ul#playeroptionsul li"):
         name = safe_text(li.select_one(".title")) or safe_text(li) or "Server"
         raw = li.get("data-src") or li.get("data-url") or ""
@@ -400,7 +382,6 @@ def parse_episode_detail(soup: BeautifulSoup, url: str):
         if clean and "http" in clean:
             servers.append({"name": name, "url": clean})
 
-    # 2) select.mirror servers (dropdown)
     if not servers:
         sel = soup.select_one("select.mirror")
         if sel:
@@ -411,7 +392,6 @@ def parse_episode_detail(soup: BeautifulSoup, url: str):
                 if clean and "http" in clean:
                     servers.append({"name": name, "url": clean})
 
-    # 3) fallback iframe
     if not servers:
         iframe = soup.select_one(".video-content iframe") or soup.select_one("iframe")
         if iframe and iframe.get("src"):
@@ -419,17 +399,15 @@ def parse_episode_detail(soup: BeautifulSoup, url: str):
 
     main_url = servers[0] if servers else {"name": "Default", "url": ""}
 
-    # --- DOWNLOADS ---
+    # DOWNLOADS
     downloads = {}
 
-    # cari area download yang mengandung resolusi
     dl_sections = []
     for box in soup.select("div, section, article"):
         t = normalize_label(box.get_text(" ", strip=True)).lower()
         if "download" in t and any(x in t for x in ["240p", "360p", "480p", "720p", "1080p"]):
             dl_sections.append(box)
 
-    # fallback container pattern lama
     dl_sections += soup.select("div.mctnx div.soraddl, div.soraurl, div.dl-box")
 
     def add_links(res_key: str, container):
@@ -442,9 +420,7 @@ def parse_episode_detail(soup: BeautifulSoup, url: str):
         if links_map:
             downloads[res_key] = links_map
 
-    # scan resolusi di setiap section
     for sec in dl_sections:
-        # coba pecah per row
         rows = sec.select("tr, li, .row, .dlrow, .dldiv, div")
         if not rows:
             rows = [sec]
@@ -469,7 +445,6 @@ def parse_episode_detail(soup: BeautifulSoup, url: str):
         u = abs_url(nav_next["href"])
         nav["next_episode"] = {"slug": extract_slug(u), "anichinUrl": u}
 
-    # Sidebar episodes list (optional)
     episodes_list = []
     for a in soup.select("div.bixbox.lpl li a"):
         href = a.get("href", "")
@@ -492,11 +467,6 @@ def parse_episode_detail(soup: BeautifulSoup, url: str):
 
 
 def scrape_all_genres():
-    """
-    Ambil all genres dari halaman filter:
-    https://anichin.moe/anime/?status=&order=
-    Biasanya ada input name="genre[]" value="adventure"
-    """
     soup = get_soup(f"{BASE_URL}/anime/", params={"status": "", "order": ""})
     if not soup:
         return []
@@ -504,21 +474,17 @@ def scrape_all_genres():
     results = []
     seen = set()
 
-    # Strategy 1: checkbox genre[]
     for inp in soup.select("input[name='genre[]']"):
         slug = (inp.get("value") or "").strip()
         if not slug:
             continue
 
-        label_txt = ""
         lab = None
         if inp.get("id"):
             lab = soup.select_one(f"label[for='{inp.get('id')}']")
         if not lab:
             lab = inp.find_parent("label")
-        label_txt = safe_text(lab)
-
-        name = label_txt or slug.replace("-", " ").title()
+        name = safe_text(lab) or slug.replace("-", " ").title()
 
         if slug not in seen:
             seen.add(slug)
@@ -531,7 +497,6 @@ def scrape_all_genres():
                 }
             )
 
-    # Strategy 2: fallback select option
     if not results:
         for opt in soup.select("select option"):
             v = (opt.get("value") or "").strip()
@@ -552,69 +517,76 @@ def scrape_all_genres():
 
 
 # --------------------------
-# ENDPOINTS: LIST
+# ENDPOINTS
 # --------------------------
 @app.get("/")
 def root():
-    return {
-        "status": "success",
-        "creator": CREATOR,
-        "message": "API hidup. Manusia tetap ribet, tapi API hidup.",
-        "docs": "/docs",
-    }
+    return {"status": "success", "creator": CREATOR, "docs": "/docs"}
 
 
+# LIST (semua support page=)
 @app.get("/api/update")
-def list_update():
-    soup = get_soup(f"{BASE_URL}/anime/", params={"status": "", "type": "", "sub": "", "order": "update"})
-    return {"status": "success", "creator": CREATOR, "order": "update", "data": parse_list_page(soup)}
+def list_update(page: int = 1):
+    page = max(1, page)
+    params = build_list_params(page, "", "", "", "update", None)
+    soup = get_soup(f"{BASE_URL}/anime/", params=params)
+    return {"status": "success", "creator": CREATOR, "order": "update", "page": page, "data": parse_list_page(soup)}
 
 
 @app.get("/api/popular")
-def list_popular():
-    soup = get_soup(f"{BASE_URL}/anime/", params={"order": "popular"})
-    return {"status": "success", "creator": CREATOR, "order": "popular", "data": parse_list_page(soup)}
+def list_popular(page: int = 1):
+    page = max(1, page)
+    params = build_list_params(page, None, None, None, "popular", None)
+    soup = get_soup(f"{BASE_URL}/anime/", params=params)
+    return {"status": "success", "creator": CREATOR, "order": "popular", "page": page, "data": parse_list_page(soup)}
 
 
 @app.get("/api/rating")
-def list_rating():
-    soup = get_soup(f"{BASE_URL}/anime/", params={"status": "", "type": "", "sub": "", "order": "rating"})
-    return {"status": "success", "creator": CREATOR, "order": "rating", "data": parse_list_page(soup)}
-
-
-@app.get("/api/completed")
-def list_completed():
-    soup = get_soup(f"{BASE_URL}/anime/", params={"status": "completed", "order": ""})
-    return {"status": "success", "creator": CREATOR, "status_filter": "completed", "data": parse_list_page(soup)}
+def list_rating(page: int = 1):
+    page = max(1, page)
+    params = build_list_params(page, "", "", "", "rating", None)
+    soup = get_soup(f"{BASE_URL}/anime/", params=params)
+    return {"status": "success", "creator": CREATOR, "order": "rating", "page": page, "data": parse_list_page(soup)}
 
 
 @app.get("/api/ongoing")
-def list_ongoing():
-    soup = get_soup(f"{BASE_URL}/anime/", params={"status": "ongoing", "type": "", "sub": ""})
-    return {"status": "success", "creator": CREATOR, "status_filter": "ongoing", "data": parse_list_page(soup)}
+def list_ongoing(page: int = 1):
+    page = max(1, page)
+    params = build_list_params(page, "ongoing", "", "", "", None)
+    soup = get_soup(f"{BASE_URL}/anime/", params=params)
+    return {"status": "success", "creator": CREATOR, "status_filter": "ongoing", "page": page, "data": parse_list_page(soup)}
+
+
+@app.get("/api/completed")
+def list_completed(page: int = 1):
+    page = max(1, page)
+    params = build_list_params(page, "completed", None, None, "", None)
+    soup = get_soup(f"{BASE_URL}/anime/", params=params)
+    return {"status": "success", "creator": CREATOR, "status_filter": "completed", "page": page, "data": parse_list_page(soup)}
 
 
 @app.get("/api/list")
 def list_universal(
+    page: int = 1,
     status: str = "",
     type: str = "",
     sub: str = "",
     order: str = "",
     genre: list[str] = Query(default=[], alias="genre[]"),
 ):
-    params = build_list_params(status, type, sub, order, genre)
+    page = max(1, page)
+    params = build_list_params(page, status, type, sub, order, genre)
     soup = get_soup(f"{BASE_URL}/anime/", params=params)
     return {
         "status": "success",
         "creator": CREATOR,
+        "page": page,
         "filters": {"status": status, "type": type, "sub": sub, "order": order, "genre[]": genre},
         "data": parse_list_page(soup),
     }
 
 
-# --------------------------
-# ENDPOINTS: GENRES
-# --------------------------
+# GENRES (all + paged per genre)
 @app.get("/api/genres")
 def all_genres():
     data = scrape_all_genres()
@@ -622,15 +594,14 @@ def all_genres():
 
 
 @app.get("/api/genres/{slug}")
-def genre_detail(slug: str):
-    params = {"genre[]": [slug], "status": "", "type": "", "sub": "", "order": ""}
+def genre_detail(slug: str, page: int = 1):
+    page = max(1, page)
+    params = build_list_params(page, "", "", "", "", [slug])
     soup = get_soup(f"{BASE_URL}/anime/", params=params)
-    return {"status": "success", "creator": CREATOR, "genre": slug, "data": parse_list_page(soup)}
+    return {"status": "success", "creator": CREATOR, "genre": slug, "page": page, "data": parse_list_page(soup)}
 
 
-# --------------------------
-# ENDPOINTS: SCHEDULE
-# --------------------------
+# SCHEDULE
 @app.get("/api/schedule")
 def schedule():
     soup = get_soup(f"{BASE_URL}/schedule/")
@@ -656,18 +627,14 @@ def schedule():
     return {"status": "success", "creator": CREATOR, "schedule": out}
 
 
-# --------------------------
-# ENDPOINTS: SEARCH
-# --------------------------
+# SEARCH
 @app.get("/api/search")
 def search(s: str = Query(..., alias="s")):
     soup = get_soup(BASE_URL, params={"s": s})
     return {"status": "success", "creator": CREATOR, "query": s, "data": parse_list_page(soup)}
 
 
-# --------------------------
-# ENDPOINTS: SERIES & EPISODE DETAIL (yang lu minta)
-# --------------------------
+# DETAILS
 @app.get("/api/series")
 def series_detail(url: str):
     if not url.startswith("http"):
@@ -688,9 +655,6 @@ def episode_detail(url: str):
     return parse_episode_detail(soup, url)
 
 
-# --------------------------
-# OPTIONAL: 1 endpoint detail auto-detect (kalau lu males mikir URL ini series atau episode)
-# --------------------------
 @app.get("/api/detail")
 def detail_auto(url: str):
     if not url.startswith("http"):
@@ -699,7 +663,6 @@ def detail_auto(url: str):
     if not soup:
         raise HTTPException(status_code=404, detail="Gagal akses page / page not found")
 
-    # deteksi episode page
     is_episode_page = bool(
         soup.select_one("#playeroptionsul")
         or soup.select_one("select.mirror")
